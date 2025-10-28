@@ -387,10 +387,15 @@ class Engine(BaseNet):
         self.Text_Adapter = nn.ModuleList()
         self.beta = 1
         self.decay = 1
+        self.mix_b = get_attribute(args, "mix_bias", 0.6)
         
         self.class_mean_list = []
         self.class_cov_list = []
         self.class_edge_distance = []
+        self.class_name_features = None
+        self.hard_pairs = None
+        # self.prev_image_adapter = None
+        # self.prev_text_adapter = None
         
     def update_stat(self, known_classes, total_classes, train_loader,device):
         print("updating stat")
@@ -425,6 +430,38 @@ class Engine(BaseNet):
             ps = torch.ones(self.mu.shape[0]).cuda() * 1. / self.mu.shape[0]
             self.W = torch.einsum('nd, dc -> cn', self.mu, self.cov_inv)
             self.b = ps.log() - torch.einsum('nd, dc, nc -> n', self.mu, self.cov_inv, self.mu) / 2
+
+    def prepare_task(self, class_names, templates, known_classes, total_classes, threshold, device):
+        self.hard_pairs = None
+        if total_classes == 0:
+            return
+
+        prompts = []
+        for cname in class_names:
+            for tmpl in templates:
+                prompts.append(tmpl.format(cname))
+        tokens = self.tokenizer(prompts).to(device)
+        text_features = self.model.encode_text(tokens)
+        templates_per_class = len(templates)
+        if templates_per_class > 0:
+            text_features = text_features.view(total_classes, templates_per_class, -1)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            text_features = text_features.mean(dim=1)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        self.class_name_features = text_features
+
+        if known_classes <= 0 or total_classes <= known_classes or threshold is None:
+            return
+
+        old_features = self.class_name_features[:known_classes].type(torch.float32)
+        new_features = self.class_name_features[known_classes:total_classes].type(torch.float32)
+        dist = torch.cdist(old_features, new_features)
+        indices = torch.nonzero(dist < threshold, as_tuple=False)
+        if indices.numel() == 0:
+            return
+        pairs = indices.clone()
+        pairs[:, 1] += known_classes
+        self.hard_pairs = pairs
 
     def _expand_token(self, token, batch_size: int):
         return token.view(1, 1, -1).expand(batch_size, -1, -1)
@@ -548,4 +585,49 @@ class Engine(BaseNet):
         for item in self.Text_Adapter:
             for param in item.parameters():
                 param.requires_grad = True
-                
+
+    # def _mix_linear(self, new_layer, old_layer):
+    #     weight_new = new_layer.weight.data
+    #     weight_old = old_layer.weight.data
+    #     U_old, S_old, V_old = torch.linalg.svd(weight_old, full_matrices=False)
+    #     P_new = U_old.T @ weight_new
+    #     dist = (P_new - torch.diag(S_old) @ V_old).abs()
+    #     if dist.max() == 0:
+    #         return
+    #     mask = dist / dist.max()
+    #     mask = torch.clamp(mask + self.mix_b, max=1)
+    #     right = P_new * mask + torch.diag(S_old) @ V_old * (1 - mask)
+    #     new_layer.weight.data = U_old @ right
+
+    # def mix_matrix(self):
+    #     if self.prev_image_adapter is not None and len(self.Image_Adapter) > 0:
+    #         self._mix_linear(self.Image_Adapter[-1].fc[0], self.prev_image_adapter.fc[0])
+    #     if self.prev_text_adapter is not None and len(self.Text_Adapter) > 0:
+    #         self._mix_linear(self.Text_Adapter[-1].fc[0], self.prev_text_adapter.fc[0])
+
+    def analyze_mean_cov(self, features, labels):
+        if features.numel() == 0:
+            return
+        unique_labels = torch.sort(torch.unique(labels))[0]
+        for l in unique_labels:
+            idx = torch.nonzero(labels == l, as_tuple=False).squeeze()
+            class_data = features[idx]
+            if class_data.ndim == 1:
+                class_data = class_data.unsqueeze(0)
+            mean = class_data.mean(dim=0)
+            cov = torch.cov(class_data.t()) + 1e-4 * torch.eye(class_data.shape[-1], device=class_data.device)
+            distance = torch.cdist(class_data, mean.unsqueeze(0)).squeeze()
+            max_distance = torch.sort(distance)[0][-10:]
+            stats = (
+                max_distance.mean() - max_distance.min(),
+                max_distance.max() - max_distance.mean(),
+                max_distance.mean(),
+            )
+            class_idx = int(l.item())
+            while len(self.class_mean_list) <= class_idx:
+                self.class_mean_list.append(None)
+                self.class_cov_list.append(None)
+                self.class_edge_distance.append(None)
+            self.class_mean_list[class_idx] = mean
+            self.class_cov_list[class_idx] = cov
+            self.class_edge_distance[class_idx] = stats

@@ -19,11 +19,79 @@ import random
 random.seed(1993)
 np.random.seed(1993)
 
+
+# def shrink_cov(cov: torch.Tensor) -> torch.Tensor:
+#     diag_mean = torch.mean(torch.diagonal(cov))
+#     off_diag = cov.clone()
+#     off_diag.fill_diagonal_(0.0)
+#     mask = off_diag != 0
+#     if mask.any():
+#         off_diag_mean = (off_diag * mask).sum() / mask.sum()
+#     else:
+#         off_diag_mean = torch.tensor(0.0, device=cov.device, dtype=cov.dtype)
+#     eye = torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype)
+#     ones = torch.ones_like(eye)
+#     return cov + diag_mean * eye + off_diag_mean * (ones - eye)
+
+
+# def sample(mean: torch.Tensor, cov: torch.Tensor, size: int, shrink: bool = False) -> torch.Tensor:
+#     if size <= 0:
+#         return torch.empty((0, mean.shape[-1]), device=mean.device, dtype=mean.dtype)
+#     cov_eff = cov.clone()
+#     if shrink:
+#         cov_eff = shrink_cov(cov_eff)
+#     eye = torch.eye(cov_eff.shape[0], device=cov_eff.device, dtype=cov_eff.dtype)
+#     jitter = 1e-6
+#     for _ in range(5):
+#         try:
+#             sqrt_cov = torch.linalg.cholesky(cov_eff)
+#             break
+#         except RuntimeError:
+#             cov_eff = cov_eff + jitter * eye
+#             jitter *= 10
+#     else:
+#         sqrt_cov = torch.linalg.cholesky(cov_eff + jitter * eye)
+#     mean_vec = mean.reshape(-1)
+#     rand = torch.randn(size, mean_vec.shape[0], device=mean_vec.device, dtype=mean_vec.dtype)
+#     return rand @ sqrt_cov.t() + mean_vec
+
+
+def shrink_cov(cov):
+    diag_mean = torch.mean(torch.diagonal(cov))
+    off_diag = cov.clone()
+    off_diag.fill_diagonal_(0.0)
+    mask = off_diag != 0.0
+    off_diag_mean = (off_diag*mask).sum() / mask.sum()
+    iden = torch.eye(cov.shape[0], device=cov.device)
+    alpha1 = 1
+    alpha2  = 1
+    cov_ = cov + (alpha1*diag_mean*iden) + (alpha2*off_diag_mean*(1-iden))
+    return cov_
+
+def sample(mean, cov, size, shrink=False):
+    vec = torch.randn(size, mean.shape[-1], device=mean.device)
+    if shrink:
+        cov = shrink_cov(cov)
+    sqrt_cov = torch.linalg.cholesky(cov)
+    vec = vec @ sqrt_cov.t()
+    vec = vec + mean
+    return vec
+
 num_workers = 8
 class Learner(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
         self.args=args
+
+        self.mix_bias = float(get_attribute(args, "mix_bias", 0.6))
+        self.beta = float(get_attribute(args, "beta", 2))
+        self.threshold = float(get_attribute(args, "threshold", 0.55))
+        shrinkage_default = get_attribute(args, "shrinkage", False)
+        self.shrinkage = bool(shrinkage_default)
+        self.args["mix_bias"] = self.mix_bias
+        self.args["beta"] = self.beta
+        self.args["threshold"] = self.threshold
+        self.args["shrinkage"] = self.shrinkage
 
         self._train_transformer=False
         self._network = Engine(args)
@@ -94,10 +162,19 @@ class Learner(BaseLearner):
         class_to_label=self.data_manager._class_to_label
         prog_bar =  tqdm(range(self.tuned_epoch))
         total_labels=class_to_label[:self._total_classes] 
-        templates=self.data_manager._data_to_prompt[0]
-        
-        from utils.toolkit import ClipLoss
+        templates_all = self.data_manager._data_to_prompt
+        primary_template = templates_all[0] if isinstance(templates_all, (list, tuple)) else templates_all
         cliploss=ClipLoss()
+
+        self._network.prepare_task(
+            class_names=total_labels,
+            templates=templates_all if isinstance(templates_all, (list, tuple)) else [templates_all],
+            known_classes=self._known_classes,
+            total_classes=self._total_classes,
+            threshold=self.threshold,
+            device=self._device,
+        )
+
         for _, epoch in enumerate(prog_bar):
             self._network.train()
             losses = 0.0
@@ -123,7 +200,7 @@ class Learner(BaseLearner):
                     targets = torch.cat([targets, proto_y], dim=0)
                 
                 labels=[class_to_label[y] for y in targets]
-                texts=[templates.format(inst) for inst in total_labels]
+                texts=[primary_template.format(inst) for inst in total_labels]
                 texts = self._network.tokenizer(texts).to(self._device)
                 text_features=self._network.encode_text(texts)
                 text_feas = text_features / text_features.norm(dim=-1, keepdim=True)
@@ -136,7 +213,45 @@ class Learner(BaseLearner):
                 logit_scale = self._network.model.logit_scale
                 logits = img_feas @ text_feas.T
 
-                texts_clip=[templates.format(inst) for inst in labels]
+                edge_sample = None
+                loss_hinge = torch.tensor(0.0, device=self._device)
+                if self._network.hard_pairs is not None and self._network.class_name_features is not None:
+                    edge_samples = []
+                    edge_p_target = []
+                    edge_n_target = []
+                    for hard_pair in self._network.hard_pairs:
+                        pos_idx = int(hard_pair[0].item())
+                        neg_idx = int(hard_pair[1].item())
+                        if pos_idx >= len(self._network.class_mean_list):
+                            continue
+                        mean = self._network.class_mean_list[pos_idx]
+                        cov = self._network.class_cov_list[pos_idx]
+                        if mean is None or cov is None:
+                            continue
+                        samples = sample(mean, cov, int(20 * self.beta), shrink=self.shrinkage)
+                        if samples.numel() == 0:
+                            continue
+                        edge_samples.append(samples)
+                        edge_p_target.append(torch.full((samples.shape[0],), pos_idx, dtype=torch.long, device=self._device))
+                        edge_n_target.append(torch.full((samples.shape[0],), neg_idx, dtype=torch.long, device=self._device))
+                    if edge_samples:
+                        edge_sample = torch.cat(edge_samples, dim=0)
+                        edge_p_target = torch.cat(edge_p_target, dim=0)
+                        edge_n_target = torch.cat(edge_n_target, dim=0)
+                        edge_sample = edge_sample.to(self._device)
+                        edge_sample_features = self._network.Image_encode(edge_sample)
+                        edge_sample_features = edge_sample_features / edge_sample_features.norm(dim=-1, keepdim=True)
+                        edge_target_features = self._network.class_name_features[edge_p_target].type(edge_sample_features.dtype)
+                        edge_target_features = edge_target_features / edge_target_features.norm(dim=-1, keepdim=True)
+                        edge_nearest_features = self._network.class_name_features[edge_n_target].type(edge_sample_features.dtype)
+                        edge_nearest_features = edge_nearest_features / edge_nearest_features.norm(dim=-1, keepdim=True)
+                        loss_hinge = torch.relu(
+                            -(edge_sample_features * edge_target_features.detach()).sum(-1)
+                            + (edge_sample_features * edge_nearest_features.detach()).sum(-1)
+                            + 0.1
+                        ).mean()
+
+                texts_clip=[primary_template.format(inst) for inst in labels]
                 clip_text_feas=self._network.encode_text(self._network.tokenizer(texts_clip).to(self._device))
                 clip_text_norm=clip_text_feas.norm(dim=-1, keepdim=True)
                 clip_text_feas = clip_text_feas / clip_text_norm
@@ -167,8 +282,8 @@ class Learner(BaseLearner):
                     ref_text_loss = sum(ref_text_loss) / repeat_
                 elif self.args['text_des'] == 0:
                     ref_text_loss = 0
-                
-                loss = clip_loss +  ref_text_loss*self.args['text_des'] + aug_image_loss*self.args['image_aug']
+
+                loss = clip_loss +  ref_text_loss*self.args['text_des'] + aug_image_loss*self.args['image_aug'] + loss_hinge
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -204,6 +319,8 @@ class Learner(BaseLearner):
             l_fea = x[index]
             l_mean = l_fea.mean(dim=0)
             self.prototype.append(l_mean)
+        self._network.analyze_mean_cov(x, y)
+        # self._network.mix_matrix()
         self._network.eval()
 
     def _compute_accuracy(self, model, loader, epoch=0):
