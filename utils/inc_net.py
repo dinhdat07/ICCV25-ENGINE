@@ -383,8 +383,10 @@ class Engine(BaseNet):
         self.visual_proj = self.visual.proj
         self.args=args
         self.freeze(self.model)
-        self.Image_Adapter = nn.ModuleList()
-        self.Text_Adapter = nn.ModuleList()
+        self.image_adapter = None
+        self.text_adapter = None
+        self.prev_image_adapter = None
+        self.prev_text_adapter = None
         self.beta = 1
         self.decay = 1
         self.mix_b = get_attribute(args, "mix_bias", 0.6)
@@ -392,11 +394,10 @@ class Engine(BaseNet):
         self.class_mean_list = []
         self.class_cov_list = []
         self.class_edge_distance = []
+
         self.class_name_features = None
         self.hard_pairs = None
-        # self.prev_image_adapter = None
-        # self.prev_text_adapter = None
-        
+                        
     def update_stat(self, known_classes, total_classes, train_loader,device):
         print("updating stat")
         with torch.no_grad():
@@ -504,26 +505,33 @@ class Engine(BaseNet):
         return pooled
 
     def update_task(self):
-        from convs.linears import Adapter,MLP_Adapter
-        if len(self.Image_Adapter)>0:
-            self.freeze(self.Image_Adapter[-1])
-            self.freeze(self.Text_Adapter[-1])
-        self.Image_Adapter.append(MLP_Adapter(512, 512))
-        self.Text_Adapter.append(MLP_Adapter(512, 512))
+        from convs.linears import MLP_Adapter
+        device = next(self.model.parameters()).device
+        if self.image_adapter is not None:
+            self.prev_image_adapter = copy.deepcopy(self.image_adapter).to(device)
+            self.freeze(self.prev_image_adapter)
+        else:
+            self.image_adapter = MLP_Adapter(512, 512).to(device)
+
+        if self.text_adapter is not None:
+            self.prev_text_adapter = copy.deepcopy(self.text_adapter).to(device)
+            self.freeze(self.prev_text_adapter)
+        else:
+            self.text_adapter = MLP_Adapter(512, 512).to(device)
+            
+    def Image_encode(self, image_features, use_prev=False):
+        adapter = self.prev_image_adapter if use_prev and self.prev_image_adapter is not None else self.image_adapter
+        if adapter is None:
+            return image_features
+        features = image_features.to(adapter.fc[0].weight.device)
+        return adapter(features)
     
-    def Image_encode(self, image_features):
-        image_res = []
-        for i in range(len(self.Image_Adapter)):
-            image_res.append(self.Image_Adapter[i](image_features))
-        image_res = torch.sum(torch.stack(image_res), dim=0)
-        return image_res
-    
-    def Text_encode(self, text_features):
-        text_res = []
-        for i in range(len(self.Text_Adapter)):
-            text_res.append(self.Text_Adapter[i](text_features))
-        text_res = torch.sum(torch.stack(text_res), dim=0)
-        return text_res
+    def Text_encode(self, text_features, use_prev=False):
+        adapter = self.prev_text_adapter if use_prev and self.prev_text_adapter is not None else self.text_adapter
+        if adapter is None:
+            return text_features
+        features = text_features.to(adapter.fc[0].weight.device)
+        return adapter(features)
     
     @property
     def feature_dim(self):
@@ -532,14 +540,14 @@ class Engine(BaseNet):
     def extract_vector(self, x):
         return self.model.encode_image(x)
 
-    def encode_image(self, x):
+    def encode_image(self, x, use_prev=False):
         imag_features =  self.model.encode_image(x)
-        imag_res = self.Image_encode(imag_features)
+        imag_res = self.Image_encode(imag_features, use_prev=use_prev)
         return imag_res
     
-    def encode_text(self, x):
+    def encode_text(self, x, use_prev=False):
         text_features = self.model.encode_text(x)
-        text_res = self.Text_encode(text_features)
+        text_res = self.Text_encode(text_features, use_prev=use_prev)
         return text_res
 
     def forward(self, img, text):
@@ -578,32 +586,31 @@ class Engine(BaseNet):
             param.requires_grad = False
             
     def activate_old_adapter(self):
-        for item in self.Image_Adapter:
-            for param in item.parameters():
+        if self.image_adapter is not None:
+            for param in self.image_adapter.parameters():
+                param.requires_grad = True
+        if self.text_adapter is not None:
+            for param in self.text_adapter.parameters():
                 param.requires_grad = True
 
-        for item in self.Text_Adapter:
-            for param in item.parameters():
-                param.requires_grad = True
+    def _mix_linear(self, new_adapter, old_adapter):
+        if new_adapter is None or old_adapter is None:
+            return
+        weight_new = new_adapter.fc[0].weight.data
+        weight_old = old_adapter.fc[0].weight.data
+        U_old, S_old, V_old = torch.linalg.svd(weight_old, full_matrices=False)
+        P_new = U_old.T @ weight_new
+        dist = (P_new - torch.diag(S_old) @ V_old).abs()
+        if dist.numel() == 0 or dist.max() == 0:
+            return
+        mask = dist / dist.max()
+        mask = torch.clamp(mask + self.mix_b, max=1)
+        right = P_new * mask + torch.diag(S_old) @ V_old * (1 - mask)
+        new_adapter.fc[0].weight.data = U_old @ right
 
-    # def _mix_linear(self, new_layer, old_layer):
-    #     weight_new = new_layer.weight.data
-    #     weight_old = old_layer.weight.data
-    #     U_old, S_old, V_old = torch.linalg.svd(weight_old, full_matrices=False)
-    #     P_new = U_old.T @ weight_new
-    #     dist = (P_new - torch.diag(S_old) @ V_old).abs()
-    #     if dist.max() == 0:
-    #         return
-    #     mask = dist / dist.max()
-    #     mask = torch.clamp(mask + self.mix_b, max=1)
-    #     right = P_new * mask + torch.diag(S_old) @ V_old * (1 - mask)
-    #     new_layer.weight.data = U_old @ right
-
-    # def mix_matrix(self):
-    #     if self.prev_image_adapter is not None and len(self.Image_Adapter) > 0:
-    #         self._mix_linear(self.Image_Adapter[-1].fc[0], self.prev_image_adapter.fc[0])
-    #     if self.prev_text_adapter is not None and len(self.Text_Adapter) > 0:
-    #         self._mix_linear(self.Text_Adapter[-1].fc[0], self.prev_text_adapter.fc[0])
+    def mix_matrix(self):
+        self._mix_linear(self.image_adapter, self.prev_image_adapter)
+        self._mix_linear(self.text_adapter, self.prev_text_adapter)
 
     def analyze_mean_cov(self, features, labels):
         if features.numel() == 0:

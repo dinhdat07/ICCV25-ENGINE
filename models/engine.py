@@ -77,7 +77,7 @@ def sample(mean, cov, size, shrink=False):
     vec = vec + mean
     return vec
 
-num_workers = 8
+num_workers = 4
 class Learner(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
@@ -180,6 +180,14 @@ class Learner(BaseLearner):
             losses = 0.0
             correct, total = 0, 0
             correct_clip = []
+            clip_sum = 0.0
+            text_sum = 0.0
+            img_sum = 0.0
+            hinge_sum = 0.0
+            def _to_float(val):
+                if isinstance(val, torch.Tensor):
+                    return float(val.detach().item())
+                return float(val)
             if self._cur_task > 0:
                 old_class = list(range(self.args['init_cls']+(self._cur_task-1)*self.args['increment']))
                 random.shuffle(old_class)
@@ -204,6 +212,7 @@ class Learner(BaseLearner):
                 texts = self._network.tokenizer(texts).to(self._device)
                 text_features=self._network.encode_text(texts)
                 text_feas = text_features / text_features.norm(dim=-1, keepdim=True)
+
                 image_features=self._network.encode_image(inputs)
                 img_feas = image_features / image_features.norm(dim=-1, keepdim=True)
                 if self._cur_task > 0:
@@ -213,6 +222,8 @@ class Learner(BaseLearner):
                 logit_scale = self._network.model.logit_scale
                 logits = img_feas @ text_feas.T
 
+
+                # calculate hinge loss for hard samples
                 edge_sample = None
                 loss_hinge = torch.tensor(0.0, device=self._device)
                 if self._network.hard_pairs is not None and self._network.class_name_features is not None:
@@ -232,8 +243,9 @@ class Learner(BaseLearner):
                         if samples.numel() == 0:
                             continue
                         edge_samples.append(samples)
-                        edge_p_target.append(torch.full((samples.shape[0],), pos_idx, dtype=torch.long, device=self._device))
-                        edge_n_target.append(torch.full((samples.shape[0],), neg_idx, dtype=torch.long, device=self._device))
+                        sample_len = int(20 * self.beta)
+                        edge_p_target.append(torch.ones(sample_len, dtype=torch.long, device=self._device) * pos_idx)
+                        edge_n_target.append(torch.ones(sample_len, dtype=torch.long, device=self._device) * neg_idx)
                     if edge_samples:
                         edge_sample = torch.cat(edge_samples, dim=0)
                         edge_p_target = torch.cat(edge_p_target, dim=0)
@@ -284,10 +296,25 @@ class Learner(BaseLearner):
                     ref_text_loss = 0
 
                 loss = clip_loss +  ref_text_loss*self.args['text_des'] + aug_image_loss*self.args['image_aug'] + loss_hinge
+                if epoch == 0 and i == 0:
+                    trainable = [name for name, param in self._network.named_parameters() if param.requires_grad]
+                    logging.info(f"Trainable parameter groups ({len(trainable)}): {trainable[:10]}{' ...' if len(trainable) > 10 else ''}")
+                    logging.info(
+                        "requires_grad status -> clip: %s, text: %s, img: %s, hinge: %s, total: %s",
+                        getattr(clip_loss, 'requires_grad', None),
+                        getattr(ref_text_loss, 'requires_grad', None) if isinstance(ref_text_loss, torch.Tensor) else None,
+                        getattr(aug_image_loss, 'requires_grad', None) if isinstance(aug_image_loss, torch.Tensor) else None,
+                        getattr(loss_hinge, 'requires_grad', None),
+                        getattr(loss, 'requires_grad', None),
+                    )
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 losses += loss.item()
+                clip_sum += _to_float(clip_loss)
+                text_sum += _to_float(ref_text_loss)
+                img_sum += _to_float(aug_image_loss)
+                hinge_sum += _to_float(loss_hinge)
                 
                 _, preds = torch.max(logits, dim=1)
                 correct += preds.eq(targets).cpu().sum()
@@ -297,12 +324,28 @@ class Learner(BaseLearner):
             scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
             test_acc = self._compute_accuracy(self._network, test_loader, epoch)
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_acc {:.2f}, Test_acc {:.2f}".format(
-                self._cur_task,epoch + 1,self.args['tuned_epoch'],losses / len(train_loader),train_acc, test_acc,  )
+            num_batches = len(train_loader) if len(train_loader) > 0 else 1
+            info = (
+                "Task {}, Epoch {}/{} => Loss {:.3f}, Train_acc {:.2f}, Test_acc {:.2f} "
+                "(clip {:.3f} | text {:.3f} | img {:.3f} | hinge {:.3f})"
+            ).format(
+                self._cur_task,
+                epoch + 1,
+                self.args['tuned_epoch'],
+                losses / len(train_loader),
+                train_acc,
+                test_acc,
+                clip_sum / num_batches,
+                text_sum / num_batches,
+                img_sum / num_batches,
+                hinge_sum / num_batches,
+            )
             prog_bar.set_description(info)
+            logging.info(info)
+            logging.info(info)
         self._network.eval()
         # analyze
-        sample_loader = DataLoader(train_dataset, batch_size=64, shuffle=False, num_workers=8)
+        sample_loader = DataLoader(train_dataset, batch_size=64, shuffle=False, num_workers=4)
         x = []
         y = []
         for i, (_, inputs, targets) in enumerate(sample_loader):
@@ -320,7 +363,7 @@ class Learner(BaseLearner):
             l_mean = l_fea.mean(dim=0)
             self.prototype.append(l_mean)
         self._network.analyze_mean_cov(x, y)
-        # self._network.mix_matrix()
+        self._network.mix_matrix()
         self._network.eval()
 
     def _compute_accuracy(self, model, loader, epoch=0):

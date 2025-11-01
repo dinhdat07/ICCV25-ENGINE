@@ -149,7 +149,7 @@ class BaseLearner(object):
             text_features = torch.stack(text_features, dim=0)
 
         test_dataset = self.data_manager.get_dataset(np.arange(0, len(total_labels)), source="test", mode="test" )
-        loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=8)
+        loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4)
 
         y_pred, y_true = [], []
         logits=[]
