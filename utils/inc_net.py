@@ -1,11 +1,12 @@
 import copy
+from itertools import chain
 import logging
 import torch
 from torch import nn
 from convs.linears import SimpleLinear, SplitCosineLinear, CosineLinear, CosineLinear_RanPAC
 import timm
 import torch.nn.functional as F
-from convs.projections import Proj_Pure_MLP, MultiHeadAttention
+from convs.projections import ENGINE_Adapter, Proj_Pure_MLP, MultiHeadAttention
 import os
 import json
 import torchvision.transforms as transforms
@@ -383,10 +384,23 @@ class Engine(BaseNet):
         self.visual_proj = self.visual.proj
         self.args=args
         self.freeze(self.model)
-        self.image_adapter = None
-        self.text_adapter = None
-        self.prev_image_adapter = None
-        self.prev_text_adapter = None
+        self.image_adapters =  nn.ModuleList()
+        self.text_adapters = nn.ModuleList()
+
+        # TUNA: non-linear adapter
+        dropout_rate = float(getattr(args, 'dropout', 0.1))
+        self.uni_image_adapter = ENGINE_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
+        self.uni_text_adapter = ENGINE_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
+        self.freeze(self.uni_image_adapter)
+        self.freeze(self.uni_text_adapter)
+
+        self.image_fusion_alpha = nn.Parameter(torch.ones(1)) 
+        self.image_fusion_beta = nn.Parameter(torch.ones(1)) 
+        
+        self.text_fusion_alpha = nn.Parameter(torch.ones(1))
+        self.text_fusion_beta = nn.Parameter(torch.ones(1))
+
+        # RAPF: mix matrix parameters
         self.beta = 1
         self.decay = 1
         self.mix_b = get_attribute(args, "mix_bias", 0.6)
@@ -402,20 +416,16 @@ class Engine(BaseNet):
         print("updating stat")
         with torch.no_grad():
             vecs = []
-            # vecs_512 = []
             labels = []
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(device), targets.to(device)
                 image_features = self.visual_forward_(inputs)
-                # image_features_512 = image_features @ self.visual_proj
                 image_features = image_features / image_features.norm(dim=-1, keepdim=True)
                 
                 vecs.append(image_features)
-                # vecs_512.append(image_features_512)
                 labels.append(targets)
 
             vecs = torch.cat(vecs)
-            # vecs_512 = torch.cat(vecs_512)
             labels = torch.cat(labels)
             
             mu = torch.cat([vecs[labels == i].mean(dim=0, keepdim=True) for i in range(known_classes, total_classes)], dim=0)
@@ -503,35 +513,148 @@ class Engine(BaseNet):
             x = self.visual.ln_post(x)
             pooled, tokens = self.visual._global_pool(x)
         return pooled
-
-    def update_task(self):
-        from convs.linears import MLP_Adapter
-        device = next(self.model.parameters()).device
-        if self.image_adapter is not None:
-            self.prev_image_adapter = copy.deepcopy(self.image_adapter).to(device)
-            self.freeze(self.prev_image_adapter)
-        else:
-            self.image_adapter = MLP_Adapter(512, 512).to(device)
-
-        if self.text_adapter is not None:
-            self.prev_text_adapter = copy.deepcopy(self.text_adapter).to(device)
-            self.freeze(self.prev_text_adapter)
-        else:
-            self.text_adapter = MLP_Adapter(512, 512).to(device)
-            
-    def Image_encode(self, image_features, use_prev=False):
-        adapter = self.prev_image_adapter if use_prev and self.prev_image_adapter is not None else self.image_adapter
-        if adapter is None:
-            return image_features
-        features = image_features.to(adapter.fc[0].weight.device)
-        return adapter(features)
     
-    def Text_encode(self, text_features, use_prev=False):
-        adapter = self.prev_text_adapter if use_prev and self.prev_text_adapter is not None else self.text_adapter
-        if adapter is None:
-            return text_features
-        features = text_features.to(adapter.fc[0].weight.device)
-        return adapter(features)
+    def get_trainable_parameters(self):
+        params = []
+        if self.image_adapters and len(self.image_adapters) > 0:
+            params.append(self.image_adapters[-1].parameters())
+            params.append([self.image_fusion_alpha, self.image_fusion_beta])
+        if self.text_adapters and len(self.text_adapters) > 0:
+            params.append(self.text_adapters[-1].parameters())
+            params.append([self.text_fusion_alpha, self.text_fusion_beta])
+        return chain.from_iterable(params)
+
+    def update_task(self, noise_std: float = 0.01):
+        
+        for inj in self.image_adapters: 
+            self.freeze(inj)
+        for inj in self.text_adapters:
+            self.freeze(inj)
+
+        dropout_rate = float(getattr(self.args, 'dropout', 0.1))
+
+        # image adapter
+        if self.image_adapters:
+            new_image_adapter = copy.deepcopy(self.image_adapters[-1])
+            for param in new_image_adapter.parameters():
+                param.data += noise_std * torch.randn_like(param.data)
+                param.requires_grad = True 
+            
+            if hasattr(new_image_adapter, 'scale'):
+                with torch.no_grad():
+                    new_image_adapter.scale.fill_(1.0)
+            self.image_adapters.append(new_image_adapter.to(self.device).to(dtype=self.dtype))
+        else:
+            self.image_adapters.append(
+                ENGINE_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
+            )
+
+        # text adapter
+        if self.text_adapters:
+            new_text_adapter = copy.deepcopy(self.text_adapter[-1])
+            for param in new_text_adapter.parameters():
+                param.data += noise_std * torch.randn_like(param.data)
+                param.requires_grad = True
+            if hasattr(new_text_adapter, 'scale'):
+                with torch.no_grad():
+                    new_text_adapter.scale.fill_(1.0)
+            self.text_adapters.append(new_text_adapter.to(self.device).to(dtype=self.dtype))
+        else:
+            self.text_adapters.append(
+                ENGINE_Adapter(512, 256, dropout=dropout_rate).to(self.device).to(dtype=self.dtype)
+            )
+        
+        # fusion for universal adapter
+        # if len(self.image_adapters) > 1:
+        #     self.mix_matrix()
+
+    def _flatten_adapter_params(self, adapter):
+        params = []
+        for name, param in adapter.named_parameters():
+            if isinstance(param, nn.Parameter):
+                params.append(param.data.flatten())
+        return torch.cat(params)
+
+    def _unflatten_adapter_params(self, adapter, flat_vector: torch.Tensor):
+        pointer = 0
+        for name, param in adapter.named_parameters():
+            if isinstance(param, nn.Parameter):
+                num_elements = param.numel()
+                param.data.copy_(
+                    flat_vector[pointer:pointer + num_elements].view_as(param.data)
+                )
+                pointer += num_elements
+        return adapter
+    
+    def mix_matrix(self):
+        if len(self.image_adapters) < 1:
+            return 
+            
+        all_flat_vectors = []
+        for adapter in self.image_adapters: 
+            all_flat_vectors.append(self._flatten_adapter_params(adapter))
+        v_uni_img = torch.stack(all_flat_vectors).mean(dim=0)
+        self._unflatten_adapter_params(self.uni_image_adapter, v_uni_img)
+        self.freeze(self.uni_image_adapter) 
+
+        all_flat_vectors = []
+        for adapter in self.text_adapters:
+            all_flat_vectors.append(self._flatten_adapter_params(adapter))
+        v_uni_txt = torch.stack(all_flat_vectors).mean(dim=0)
+        self._unflatten_adapter_params(self.uni_text_adapter, v_uni_txt)
+        self.freeze(self.uni_text_adapter)
+            
+    def Text_encode(self, features: torch.Tensor):
+        if len(self.text_adapters) == 0:
+            return features
+                    
+        device = features.device
+        
+        try:
+            target_dtype = next(self.text_adapters[0].parameters()).dtype
+        except StopIteration:
+            target_dtype = features.dtype
+            
+        features = features.to(dtype=target_dtype)
+        
+        uni_output = self.uni_text_adapter(features)
+        task_output = self.text_adapters[-1](features)
+
+        alpha = self.text_fusion_alpha.to(device)
+        beta = self.text_fusion_beta.to(device)
+
+        fusion_weights = torch.stack([alpha, beta], dim=0)
+        normalized_weights = F.softmax(fusion_weights, dim=0)
+        alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
+
+        outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
+                    
+        return outputs
+    
+    def Image_encode(self, features: torch.Tensor) -> torch.Tensor:
+        if len(self.image_adapters) == 0:
+            return features
+        device = features.device 
+        try:
+            target_dtype = next(self.image_adapters[0].parameters()).dtype
+        except StopIteration:
+            target_dtype = features.dtype
+            
+        features = features.to(dtype=target_dtype)
+        
+        uni_output = self.uni_image_adapter(features)
+        task_output = self.image_adapters[-1](features)
+
+        alpha = self.image_fusion_alpha.to(device)
+        beta = self.image_fusion_beta.to(device)
+        
+        fusion_weights = torch.stack([alpha, beta], dim=0)
+        normalized_weights = F.softmax(fusion_weights, dim=0)
+        alpha_hat, beta_hat = normalized_weights[0], normalized_weights[1]
+
+        outputs = (alpha_hat * uni_output) + (beta_hat * task_output)
+        
+        return outputs
     
     @property
     def feature_dim(self):
@@ -540,14 +663,14 @@ class Engine(BaseNet):
     def extract_vector(self, x):
         return self.model.encode_image(x)
 
-    def encode_image(self, x, use_prev=False):
+    def encode_image(self, x):
         imag_features =  self.model.encode_image(x)
-        imag_res = self.Image_encode(imag_features, use_prev=use_prev)
+        imag_res = self.Image_encode(imag_features)
         return imag_res
     
-    def encode_text(self, x, use_prev=False):
+    def encode_text(self, x):
         text_features = self.model.encode_text(x)
-        text_res = self.Text_encode(text_features, use_prev=use_prev)
+        text_res = self.Text_encode(text_features)
         return text_res
 
     def forward(self, img, text):
@@ -584,33 +707,6 @@ class Engine(BaseNet):
     def freeze(self, model):
         for param in model.parameters():
             param.requires_grad = False
-            
-    def activate_old_adapter(self):
-        if self.image_adapter is not None:
-            for param in self.image_adapter.parameters():
-                param.requires_grad = True
-        if self.text_adapter is not None:
-            for param in self.text_adapter.parameters():
-                param.requires_grad = True
-
-    def _mix_linear(self, new_adapter, old_adapter):
-        if new_adapter is None or old_adapter is None:
-            return
-        weight_new = new_adapter.fc[0].weight.data
-        weight_old = old_adapter.fc[0].weight.data
-        U_old, S_old, V_old = torch.linalg.svd(weight_old, full_matrices=False)
-        P_new = U_old.T @ weight_new
-        dist = (P_new - torch.diag(S_old) @ V_old).abs()
-        if dist.numel() == 0 or dist.max() == 0:
-            return
-        mask = dist / dist.max()
-        mask = torch.clamp(mask + self.mix_b, max=1)
-        right = P_new * mask + torch.diag(S_old) @ V_old * (1 - mask)
-        new_adapter.fc[0].weight.data = U_old @ right
-
-    def mix_matrix(self):
-        self._mix_linear(self.image_adapter, self.prev_image_adapter)
-        self._mix_linear(self.text_adapter, self.prev_text_adapter)
 
     def analyze_mean_cov(self, features, labels):
         if features.numel() == 0:

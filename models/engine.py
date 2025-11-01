@@ -20,42 +20,6 @@ random.seed(1993)
 np.random.seed(1993)
 
 
-# def shrink_cov(cov: torch.Tensor) -> torch.Tensor:
-#     diag_mean = torch.mean(torch.diagonal(cov))
-#     off_diag = cov.clone()
-#     off_diag.fill_diagonal_(0.0)
-#     mask = off_diag != 0
-#     if mask.any():
-#         off_diag_mean = (off_diag * mask).sum() / mask.sum()
-#     else:
-#         off_diag_mean = torch.tensor(0.0, device=cov.device, dtype=cov.dtype)
-#     eye = torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype)
-#     ones = torch.ones_like(eye)
-#     return cov + diag_mean * eye + off_diag_mean * (ones - eye)
-
-
-# def sample(mean: torch.Tensor, cov: torch.Tensor, size: int, shrink: bool = False) -> torch.Tensor:
-#     if size <= 0:
-#         return torch.empty((0, mean.shape[-1]), device=mean.device, dtype=mean.dtype)
-#     cov_eff = cov.clone()
-#     if shrink:
-#         cov_eff = shrink_cov(cov_eff)
-#     eye = torch.eye(cov_eff.shape[0], device=cov_eff.device, dtype=cov_eff.dtype)
-#     jitter = 1e-6
-#     for _ in range(5):
-#         try:
-#             sqrt_cov = torch.linalg.cholesky(cov_eff)
-#             break
-#         except RuntimeError:
-#             cov_eff = cov_eff + jitter * eye
-#             jitter *= 10
-#     else:
-#         sqrt_cov = torch.linalg.cholesky(cov_eff + jitter * eye)
-#     mean_vec = mean.reshape(-1)
-#     rand = torch.randn(size, mean_vec.shape[0], device=mean_vec.device, dtype=mean_vec.dtype)
-#     return rand @ sqrt_cov.t() + mean_vec
-
-
 def shrink_cov(cov):
     diag_mean = torch.mean(torch.diagonal(cov))
     off_diag = cov.clone()
@@ -84,14 +48,16 @@ class Learner(BaseLearner):
         self.args=args
 
         self.mix_bias = float(get_attribute(args, "mix_bias", 0.6))
-        self.beta = float(get_attribute(args, "beta", 2))
+        self.beta = float(get_attribute(args, "beta", 0.5))
         self.threshold = float(get_attribute(args, "threshold", 0.55))
         shrinkage_default = get_attribute(args, "shrinkage", False)
         self.shrinkage = bool(shrinkage_default)
+        self.dropout_rate = float(getattr(args, 'dropout', 0.1))
         self.args["mix_bias"] = self.mix_bias
         self.args["beta"] = self.beta
         self.args["threshold"] = self.threshold
         self.args["shrinkage"] = self.shrinkage
+        self.args["dropout"] = self.dropout_rate
 
         self._train_transformer=False
         self._network = Engine(args)
@@ -154,9 +120,9 @@ class Learner(BaseLearner):
     def train(self, train_loader, test_loader, train_dataset):
         self._network.to(self._device)
         if self.args['optimizer']=='sgd':
-            optimizer = optim.SGD(self._network.parameters(), momentum=0.9, lr=self.init_lr,weight_decay=self.weight_decay)
+            optimizer = optim.SGD(self._network.get_trainable_parameters(), momentum=0.9, lr=self.init_lr,weight_decay=self.weight_decay)
         elif self.args['optimizer']=='adam': 
-            optimizer=optim.AdamW(self._network.parameters(), lr=self.init_lr, weight_decay=self.weight_decay)
+            optimizer=optim.AdamW(self._network.get_trainable_parameters(), lr=self.init_lr, weight_decay=self.weight_decay)
         scheduler=optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.args['tuned_epoch'], eta_min=self.min_lr)
 
         class_to_label=self.data_manager._class_to_label
