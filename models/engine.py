@@ -36,7 +36,7 @@ class Learner(BaseLearner):
         self.min_lr=  get_attribute(args,"min_lr", 1e-8)
         self.frozen_layers=  get_attribute(args,"frozen_layers", None)
         self.tuned_epoch =  get_attribute(args,"tuned_epoch", 5)
-        self.hinge_margin = get_attribute(args, "hinge_margin", 0.1)
+        self.hinge_margin = get_attribute(args, "hinge_margin", 0.55)
         self.hinge_samples_per_class = int(get_attribute(args, "hinge_samples_per_class", 1))
         self.cov_shrink = get_attribute(args, "cov_shrink", False)
         self._known_classes = 0

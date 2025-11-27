@@ -387,7 +387,7 @@ class Engine(BaseNet):
         self.text_adapter = None
         self.beta = 1
         self.decay = 1
-        self.mix_b = get_attribute(args, "mix_bias", 0.7)
+        self.mix_b = get_attribute(args, "mix_bias", 0.6)
         self.cov_shrink = get_attribute(args, "cov_shrink", False)
         
         self.class_mean_list = []
