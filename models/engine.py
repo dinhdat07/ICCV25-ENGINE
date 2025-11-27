@@ -27,6 +27,8 @@ class Learner(BaseLearner):
 
         self._train_transformer=False
         self._network = Engine(args)
+        self._cached_text_features = None
+        self._nearest_class = None
         
         self.batch_size= get_attribute(args,"batch_size", 48)
         self.init_lr= get_attribute(args,"init_lr", 0.01)
@@ -34,6 +36,9 @@ class Learner(BaseLearner):
         self.min_lr=  get_attribute(args,"min_lr", 1e-8)
         self.frozen_layers=  get_attribute(args,"frozen_layers", None)
         self.tuned_epoch =  get_attribute(args,"tuned_epoch", 5)
+        self.hinge_margin = get_attribute(args, "hinge_margin", 0.1)
+        self.hinge_samples_per_class = int(get_attribute(args, "hinge_samples_per_class", 1))
+        self.cov_shrink = get_attribute(args, "cov_shrink", False)
         self._known_classes = 0
         self.prototype = []
         
@@ -71,9 +76,23 @@ class Learner(BaseLearner):
         self.train_dataset=train_dataset
         self.data_manager=data_manager
         self._network.to(self._device)
-        self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+        )
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test" )
-        self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
+        self.test_loader = DataLoader(
+            test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+        )
         if len(self._multiple_gpus) > 1:
             print('Multiple GPUs')
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
@@ -81,7 +100,34 @@ class Learner(BaseLearner):
             self._network = self._network.module
         self._network.update_task()
         self._network.update_stat(self._known_classes,self._total_classes, self.train_loader, self._device)
+        self._cache_text_features()
         self.train(self.train_loader, self.test_loader, train_dataset)
+
+    def _cache_text_features(self):
+        self._cached_text_features = None
+        self._nearest_class = None
+        class_to_label = self.data_manager._class_to_label
+        total_labels = class_to_label[:self._total_classes]
+        templates = self.data_manager._data_to_prompt
+        text_features = []
+        with torch.no_grad():
+            for l in total_labels:
+                texts = [t.format(l) for t in templates]
+                tokens = self._network.tokenizer(texts).to(self._device)
+                class_embeddings = self._network.encode_text(tokens)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                class_embeddings = class_embeddings.mean(dim=0)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                text_features.append(class_embeddings)
+        if text_features:
+            self._cached_text_features = torch.stack(text_features, dim=0)
+            # precompute nearest other class for hinge loss
+            sim = self._cached_text_features @ self._cached_text_features.T
+            sim.fill_diagonal_(-float("inf"))
+            self._nearest_class = sim.argmax(dim=1)
+        else:
+            self._cached_text_features = None
+            self._nearest_class = None
             
     def train(self, train_loader, test_loader, train_dataset):
         self._network.to(self._device)
@@ -101,8 +147,10 @@ class Learner(BaseLearner):
         for _, epoch in enumerate(prog_bar):
             self._network.train()
             losses = 0.0
-            correct, total = 0, 0
-            correct_clip = []
+            clip_losses = 0.0
+            aug_image_losses = 0.0
+            ref_text_losses = 0.0
+            hinge_losses = 0.0
             if self._cur_task > 0:
                 old_class = list(range(self.args['init_cls']+(self._cur_task-1)*self.args['increment']))
                 random.shuffle(old_class)
@@ -111,25 +159,41 @@ class Learner(BaseLearner):
                 inputs = inputs.to(self._device)
                 targets = targets.to(self._device)
                 
+                sg_image_features = None
+                proto_x = None
+                proto_y = None
                 if self._cur_task > 0:
                     proto_x = []
                     proto_y = []
-                    old_class = random.choices(old_class, k=self.args['sample_num']) if self.args['sample_num'] > 0 else old_class
-                    for j in old_class:
-                        proto_x.append(torch.stack([self.prototype[j]+torch.randn_like(self.prototype[j])*self.args['sample_noise']], dim=0))
-                        proto_y.append(torch.ones(int(1), dtype=torch.long, device=self._device)*j)
-                    proto_x = torch.cat(proto_x, dim=0)
-                    proto_y = torch.cat(proto_y, dim=0)
-                    targets = torch.cat([targets, proto_y], dim=0)
+                    selected_old_class = random.choices(old_class, k=self.args['sample_num']) if self.args['sample_num'] > 0 else old_class
+                    for j in selected_old_class:
+                        sampled = self._network.sample_class(j, self.hinge_samples_per_class)
+                        if sampled is None:
+                            base_proto = self.prototype[j]
+                            sampled = torch.stack(
+                                [base_proto + torch.randn_like(base_proto) * self.args['sample_noise'] for _ in range(self.hinge_samples_per_class)],
+                                dim=0,
+                            )
+                        proto_x.append(sampled)
+                        proto_y.append(torch.ones(sampled.shape[0], dtype=torch.long, device=self._device) * j)
+                    if proto_x:
+                        proto_x = torch.cat(proto_x, dim=0)
+                        proto_y = torch.cat(proto_y, dim=0)
+                        targets = torch.cat([targets, proto_y], dim=0)
+                    else:
+                        proto_x, proto_y = None, None
                 
                 labels=[class_to_label[y] for y in targets]
-                texts=[templates.format(inst) for inst in total_labels]
-                texts = self._network.tokenizer(texts).to(self._device)
-                text_features=self._network.encode_text(texts)
-                text_feas = text_features / text_features.norm(dim=-1, keepdim=True)
+                text_feas = self._cached_text_features
+                if text_feas is None:
+                    texts=[templates.format(inst) for inst in total_labels]
+                    texts = self._network.tokenizer(texts).to(self._device)
+                    text_features=self._network.encode_text(texts)
+                    text_feas = text_features / text_features.norm(dim=-1, keepdim=True)
+                    self._cached_text_features = text_feas.detach()
                 image_features=self._network.encode_image(inputs)
                 img_feas = image_features / image_features.norm(dim=-1, keepdim=True)
-                if self._cur_task > 0:
+                if self._cur_task > 0 and proto_x is not None:
                     sg_image_features = self._network.Image_encode(proto_x)
                     sg_image_features = sg_image_features / sg_image_features.norm(dim=-1, keepdim=True)
                     img_feas = torch.cat([img_feas, sg_image_features], dim=0)
@@ -142,6 +206,21 @@ class Learner(BaseLearner):
                 clip_text_feas = clip_text_feas / clip_text_norm
                 clip_loss=cliploss(img_feas, clip_text_feas, logit_scale)
                 
+                # hinge loss using nearest-class text (RAPF-style)
+                loss_hinge = torch.tensor(0.0, device=self._device)
+                if (
+                    self._cur_task > 0
+                    and proto_y is not None
+                    and proto_y.numel() > 0
+                    and self._nearest_class is not None
+                    and sg_image_features is not None
+                ):
+                    pos_text = text_feas[proto_y]
+                    neg_text = text_feas[self._nearest_class[proto_y]]
+                    pos_sim = (sg_image_features * pos_text).sum(dim=-1, keepdim=True)
+                    neg_sim = (sg_image_features * neg_text).sum(dim=-1, keepdim=True)
+                    loss_hinge = F.relu(-pos_sim + neg_sim + self.hinge_margin).mean()
+
                 # calculate image aug loss
                 from utils.loss import CosineSimilarityLoss, InfoNCELoss, contrastive_loss
                 if self.args['image_aug'] >0 :
@@ -168,26 +247,39 @@ class Learner(BaseLearner):
                 elif self.args['text_des'] == 0:
                     ref_text_loss = 0
                 
-                loss = clip_loss +  ref_text_loss*self.args['text_des'] + aug_image_loss*self.args['image_aug']
+                loss = clip_loss +  ref_text_loss*self.args['text_des'] + aug_image_loss*self.args['image_aug'] + loss_hinge
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 losses += loss.item()
-                
-                _, preds = torch.max(logits, dim=1)
-                correct += preds.eq(targets).cpu().sum()
-                correct_clip.append(preds.eq(targets).cpu())
-                total += len(targets)
+                clip_losses += clip_loss.item() if torch.is_tensor(clip_loss) else clip_loss
+                aug_image_losses += aug_image_loss if isinstance(aug_image_loss, (int, float)) else getattr(aug_image_loss, "item", lambda: 0)()
+                ref_text_losses += ref_text_loss if isinstance(ref_text_loss, (int, float)) else getattr(ref_text_loss, "item", lambda: 0)()
+                hinge_losses += loss_hinge.item()
 
             scheduler.step()
-            train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-            test_acc = self._compute_accuracy(self._network, test_loader, epoch)
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_acc {:.2f}, Test_acc {:.2f}".format(
-                self._cur_task,epoch + 1,self.args['tuned_epoch'],losses / len(train_loader),train_acc, test_acc,  )
+            num_batches = max(len(train_loader), 1)
+            info = (
+                f"Task {self._cur_task}, Epoch {epoch + 1}/{self.args['tuned_epoch']} => "
+                f"Loss {losses / num_batches:.3f} "
+                f"(clip {clip_losses / num_batches:.3f}, "
+                f"text_aug {ref_text_losses / num_batches:.3f}, "
+                f"img_aug {aug_image_losses / num_batches:.3f}, "
+                f"hinge {hinge_losses / num_batches:.3f})"
+            )
             prog_bar.set_description(info)
+        
         self._network.eval()
+        
         # analyze
-        sample_loader = DataLoader(train_dataset, batch_size=64, shuffle=False, num_workers=8)
+        sample_loader = DataLoader(
+            train_dataset,
+            batch_size=64,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+        )
         x = []
         y = []
         for i, (_, inputs, targets) in enumerate(sample_loader):
@@ -198,31 +290,39 @@ class Learner(BaseLearner):
                 y.append(targets)
         y = torch.cat(y, dim=0)
         x = torch.cat(x, dim=0)
+        self._network.analyze_mean_cov(x, y)
         label = torch.sort(torch.unique(y))[0]
         for l in label:
             index = torch.nonzero(y == l).squeeze()
             l_fea = x[index]
             l_mean = l_fea.mean(dim=0)
             self.prototype.append(l_mean)
-        self._network.eval()
+        
+        self._network.mix_matrix()
+        final_acc = self._compute_accuracy(self._network, test_loader, self.tuned_epoch - 1)
+        logging.info("Task {} final Test_acc {:.2f}".format(self._cur_task, final_acc))
 
     def _compute_accuracy(self, model, loader, epoch=0):
+        # ensure adapters are blended before running any inference
         self._network.eval()
         class_to_label=self.data_manager._class_to_label
         templates=self.data_manager._data_to_prompt
         total_labels=class_to_label[:self._total_classes] # mask all known classes
-        text_features = []
         with torch.no_grad():
-            for l in total_labels:
-                texts = [t.format(l) for t in templates]
-                texts = self._network.tokenizer(texts).cuda()
-                class_embeddings = self._network.encode_text(texts)
-                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-                class_embeddings = class_embeddings.mean(dim=0)
-                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-
-                text_features.append(class_embeddings)
-            text_features = torch.stack(text_features, dim=0)
+            if self._cached_text_features is not None and self._cached_text_features.shape[0] == len(total_labels):
+                text_features = self._cached_text_features.to(self._device)
+            else:
+                text_features = []
+                for l in total_labels:
+                    texts = [t.format(l) for t in templates]
+                    texts = self._network.tokenizer(texts).cuda()
+                    class_embeddings = self._network.encode_text(texts)
+                    class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                    class_embeddings = class_embeddings.mean(dim=0)
+                    class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                    text_features.append(class_embeddings)
+                text_features = torch.stack(text_features, dim=0)
+                self._cached_text_features = text_features.detach()
         
         correct, total = 0, 0
         for i, (_, inputs, targets) in enumerate(loader):

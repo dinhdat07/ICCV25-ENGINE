@@ -383,14 +383,18 @@ class Engine(BaseNet):
         self.visual_proj = self.visual.proj
         self.args=args
         self.freeze(self.model)
-        self.Image_Adapter = nn.ModuleList()
-        self.Text_Adapter = nn.ModuleList()
+        self.image_adapter = None
+        self.text_adapter = None
         self.beta = 1
         self.decay = 1
+        self.mix_b = get_attribute(args, "mix_bias", 0.7)
+        self.cov_shrink = get_attribute(args, "cov_shrink", False)
         
         self.class_mean_list = []
         self.class_cov_list = []
         self.class_edge_distance = []
+        self.old_image_adapter = None
+        self.old_text_adapter = None
         
     def update_stat(self, known_classes, total_classes, train_loader,device):
         print("updating stat")
@@ -468,25 +472,27 @@ class Engine(BaseNet):
 
     def update_task(self):
         from convs.linears import Adapter,MLP_Adapter
-        if len(self.Image_Adapter)>0:
-            self.freeze(self.Image_Adapter[-1])
-            self.freeze(self.Text_Adapter[-1])
-        self.Image_Adapter.append(MLP_Adapter(512, 512))
-        self.Text_Adapter.append(MLP_Adapter(512, 512))
+        device = next(self.model.parameters()).device
+        if self.image_adapter is not None:
+            self.old_image_adapter = copy.deepcopy(self.image_adapter)
+            self.old_text_adapter = copy.deepcopy(self.text_adapter)
+            self.freeze(self.old_image_adapter)
+            self.freeze(self.old_text_adapter)
+        else:
+            self.old_image_adapter = None
+            self.old_text_adapter = None
+            self.image_adapter = MLP_Adapter(512, 512).to(device)
+            self.text_adapter = MLP_Adapter(512, 512).to(device)
     
     def Image_encode(self, image_features):
-        image_res = []
-        for i in range(len(self.Image_Adapter)):
-            image_res.append(self.Image_Adapter[i](image_features))
-        image_res = torch.sum(torch.stack(image_res), dim=0)
-        return image_res
+        if self.image_adapter is None:
+            return image_features
+        return self.image_adapter(image_features)
     
     def Text_encode(self, text_features):
-        text_res = []
-        for i in range(len(self.Text_Adapter)):
-            text_res.append(self.Text_Adapter[i](text_features))
-        text_res = torch.sum(torch.stack(text_res), dim=0)
-        return text_res
+        if self.text_adapter is None:
+            return text_features
+        return self.text_adapter(text_features)
     
     @property
     def feature_dim(self):
@@ -535,17 +541,90 @@ class Engine(BaseNet):
             for i in range(image_features_raw.shape[0]):
                 new_logits[i, top5_predict[i]] = logits[i]
             return new_logits
+
+    def analyze_mean_cov(self, features, labels):
+        label_ids = torch.sort(torch.unique(labels))[0]
+        for l in label_ids:
+            index = torch.nonzero(labels == l).squeeze()
+            class_data = features[index]
+            mean = class_data.mean(dim=0)
+            cov = torch.cov(class_data.t()) + 1e-4 * torch.eye(class_data.shape[-1], device=class_data.device)
+            distance = torch.cdist(class_data, mean.unsqueeze(0)).squeeze()
+            max_distance = torch.sort(distance)[0][-10:]
+            self.class_edge_distance.append(
+                (max_distance.mean() - max_distance.min(), max_distance.max() - max_distance.mean(), max_distance.mean())
+            )
+            self.class_mean_list.append(mean)
+            self.class_cov_list.append(cov)
+
+    def shrink_cov(self, cov):
+        diag_mean = torch.mean(torch.diagonal(cov))
+        off_diag = cov.clone()
+        off_diag.fill_diagonal_(0.0)
+        mask = off_diag != 0.0
+        off_diag_mean = (off_diag * mask).sum() / (mask.sum() + 1e-12)
+        iden = torch.eye(cov.shape[0], device=cov.device)
+        alpha1 = 1
+        alpha2 = 1
+        cov_ = cov + (alpha1 * diag_mean * iden) + (alpha2 * off_diag_mean * (1 - iden))
+        return cov_
+
+    def sample(self, mean, cov, size, shrink=False):
+        vec = torch.randn(size, mean.shape[-1], device=mean.device)
+        cov_mat = self.shrink_cov(cov) if shrink else cov
+        sqrt_cov = torch.linalg.cholesky(cov_mat)
+        vec = vec @ sqrt_cov.t()
+        vec = vec + mean
+        return vec
+
+    def sample_class(self, class_idx: int, size: int):
+        if class_idx >= len(self.class_mean_list) or class_idx >= len(self.class_cov_list):
+            return None
+        return self.sample(self.class_mean_list[class_idx], self.class_cov_list[class_idx], size, shrink=self.cov_shrink)
         
     def freeze(self, model):
+        if model is None:
+            return
         for param in model.parameters():
             param.requires_grad = False
             
     def activate_old_adapter(self):
-        for item in self.Image_Adapter:
-            for param in item.parameters():
+        if self.image_adapter is not None:
+            for param in self.image_adapter.parameters():
+                param.requires_grad = True
+        if self.text_adapter is not None:
+            for param in self.text_adapter.parameters():
                 param.requires_grad = True
 
-        for item in self.Text_Adapter:
-            for param in item.parameters():
-                param.requires_grad = True
-                
+    def _get_first_linear(self, adapter):
+        if adapter is None:
+            return None
+        for module in adapter.modules():
+            if isinstance(module, nn.Linear):
+                return module
+        return None
+
+    def _mix_single_adapter(self, new_adapter, old_adapter):
+        new_linear = self._get_first_linear(new_adapter)
+        old_linear = self._get_first_linear(old_adapter)
+        if new_linear is None or old_linear is None:
+            return
+        weight_new = new_linear.weight.data
+        weight_old = old_linear.weight.data
+        U_old, S_old, V_old = torch.linalg.svd(weight_old, full_matrices=False)
+        P_new = U_old.T @ weight_new
+        baseline = torch.diag(S_old) @ V_old
+        dist = (P_new - baseline).abs()
+        denom = torch.clamp(dist.max(), min=1e-12)
+        mask = torch.clamp(dist / denom + self.mix_b, max=1)
+        right = P_new * mask + baseline * (1 - mask)
+        mixed_weight = U_old @ right
+        new_linear.weight.data.copy_(mixed_weight)
+        if new_linear.bias is not None and old_linear.bias is not None:
+            new_linear.bias.data.copy_((1 - self.mix_b) * new_linear.bias.data + self.mix_b * old_linear.bias.data)
+
+    def mix_matrix(self):
+        self._mix_single_adapter(self.image_adapter, self.old_image_adapter)
+        self._mix_single_adapter(self.text_adapter, self.old_text_adapter)
+        self.old_image_adapter = None
+        self.old_text_adapter = None

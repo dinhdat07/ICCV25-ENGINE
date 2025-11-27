@@ -58,7 +58,14 @@ class BaseLearner(object):
         print('now draw tsne results of extracted features.')
         tot_classes=self._total_classes
         test_dataset = self.data_manager.get_dataset(np.arange(0, tot_classes), source='test', mode='test')
-        valloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+        valloader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True,
+        )
         vectors, y_true = self._extract_vectors(valloader)
         if showcenters:
             fc_weight=self._network.fc.proj.cpu().detach().numpy()[:tot_classes]
@@ -132,6 +139,8 @@ class BaseLearner(object):
         return cnn_accy, nme_accy, zs_seen, zs_unseen, zs_harmonic, zs_total
 
     def _eval_zero_shot(self):  
+        if hasattr(self._network, "mix_matrix"):
+            self._network.mix_matrix()
         self._network.eval()
         class_to_label=self.data_manager._class_to_label
         templates=self.data_manager._data_to_prompt
@@ -149,7 +158,14 @@ class BaseLearner(object):
             text_features = torch.stack(text_features, dim=0)
 
         test_dataset = self.data_manager.get_dataset(np.arange(0, len(total_labels)), source="test", mode="test" )
-        loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=8)
+        loader = DataLoader(
+            test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=8,
+            pin_memory=True,
+            persistent_workers=True,
+        )
 
         y_pred, y_true = [], []
         logits=[]
@@ -195,6 +211,8 @@ class BaseLearner(object):
         return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
     def _eval_cnn(self, loader):
+        if hasattr(self._network, "mix_matrix"):
+            self._network.mix_matrix()
         self._network.eval()
         y_pred, y_true = [], []
         for _, (_, inputs, targets) in enumerate(loader):

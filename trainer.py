@@ -87,8 +87,8 @@ def _set_random():
     torch.manual_seed(1)
     torch.cuda.manual_seed(1)
     torch.cuda.manual_seed_all(1)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
     random.seed(1993)
     np.random.seed(1993)
 
