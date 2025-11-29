@@ -36,11 +36,14 @@ class Learner(BaseLearner):
         self.min_lr=  get_attribute(args,"min_lr", 1e-8)
         self.frozen_layers=  get_attribute(args,"frozen_layers", None)
         self.tuned_epoch =  get_attribute(args,"tuned_epoch", 5)
-        self.hinge_margin = get_attribute(args, "hinge_margin", 0.55)
+        self.hinge_margin = get_attribute(args, "hinge_margin", 0.1)
         self.hinge_samples_per_class = int(get_attribute(args, "hinge_samples_per_class", 1))
         self.cov_shrink = get_attribute(args, "cov_shrink", False)
+        self.hard_pair_threshold = get_attribute(args, "hard_pair_threshold", 0.55)
+        self.hard_pair_topk = int(get_attribute(args, "hard_pair_topk", 0))
         self._known_classes = 0
         self.prototype = []
+        self._hard_pair_lookup = None
         
         self.new_des_dict=self._get_text_des(self.args['dataset'])
 
@@ -106,6 +109,7 @@ class Learner(BaseLearner):
     def _cache_text_features(self):
         self._cached_text_features = None
         self._nearest_class = None
+        self._hard_pair_lookup = None
         class_to_label = self.data_manager._class_to_label
         total_labels = class_to_label[:self._total_classes]
         templates = self.data_manager._data_to_prompt
@@ -125,9 +129,11 @@ class Learner(BaseLearner):
             sim = self._cached_text_features @ self._cached_text_features.T
             sim.fill_diagonal_(-float("inf"))
             self._nearest_class = sim.argmax(dim=1)
+            self._build_hard_pairs()
         else:
             self._cached_text_features = None
             self._nearest_class = None
+            self._hard_pair_lookup = None
             
     def train(self, train_loader, test_loader, train_dataset):
         self._network.to(self._device)
@@ -212,11 +218,22 @@ class Learner(BaseLearner):
                     self._cur_task > 0
                     and proto_y is not None
                     and proto_y.numel() > 0
-                    and self._nearest_class is not None
                     and sg_image_features is not None
                 ):
                     pos_text = text_feas[proto_y]
-                    neg_text = text_feas[self._nearest_class[proto_y]]
+                    if self._hard_pair_lookup:
+                        neg_indices = []
+                        for label in proto_y.tolist():
+                            if label in self._hard_pair_lookup:
+                                choices = self._hard_pair_lookup[label]
+                                neg_idx = random.choice(choices)
+                            else:
+                                neg_idx = int(self._nearest_class[label].item())
+                            neg_indices.append(neg_idx)
+                        neg_indices = torch.tensor(neg_indices, device=self._device, dtype=torch.long)
+                    else:
+                        neg_indices = self._nearest_class[proto_y]
+                    neg_text = text_feas[neg_indices]
                     pos_sim = (sg_image_features * pos_text).sum(dim=-1, keepdim=True)
                     neg_sim = (sg_image_features * neg_text).sum(dim=-1, keepdim=True)
                     loss_hinge = F.relu(-pos_sim + neg_sim + self.hinge_margin).mean()
@@ -261,11 +278,10 @@ class Learner(BaseLearner):
             num_batches = max(len(train_loader), 1)
             info = (
                 f"Task {self._cur_task}, Epoch {epoch + 1}/{self.args['tuned_epoch']} => "
-                f"Loss {losses / num_batches:.3f} "
                 f"(clip {clip_losses / num_batches:.3f}, "
+                f"hinge {hinge_losses / num_batches:.3f},"
                 f"text_aug {ref_text_losses / num_batches:.3f}, "
-                f"img_aug {aug_image_losses / num_batches:.3f}, "
-                f"hinge {hinge_losses / num_batches:.3f})"
+                f"img_aug {aug_image_losses / num_batches:.3f}) "
             )
             prog_bar.set_description(info)
         
@@ -301,6 +317,33 @@ class Learner(BaseLearner):
         self._network.mix_matrix()
         final_acc = self._compute_accuracy(self._network, test_loader, self.tuned_epoch - 1)
         logging.info("Task {} final Test_acc {:.2f}".format(self._cur_task, final_acc))
+
+    def _build_hard_pairs(self):
+        """Build hard pairs between new classes and previous classes based on text similarity"""
+        if self._cached_text_features is None or self._known_classes == 0:
+            self._hard_pair_lookup = None
+            return
+        old_feats = self._cached_text_features[: self._known_classes]
+        new_feats = self._cached_text_features[self._known_classes : self._total_classes]
+        if new_feats.numel() == 0 or old_feats.numel() == 0:
+            self._hard_pair_lookup = None
+            return
+        # Use cosine distance (features already normalized)
+        dist = torch.cdist(new_feats, old_feats)
+        hard_map = {}
+        for idx_new in range(new_feats.shape[0]):
+            new_class_global = self._known_classes + idx_new
+            drow = dist[idx_new]
+            selected = []
+            if self.hard_pair_threshold > 0:
+                sel_idx = torch.nonzero(drow < self.hard_pair_threshold, as_tuple=False).flatten()
+                selected = sel_idx.tolist()
+            if (not selected) and self.hard_pair_topk > 0:
+                topk = min(self.hard_pair_topk, drow.numel())
+                selected = torch.topk(-drow, k=topk, largest=True).indices.tolist()
+            if selected:
+                hard_map[new_class_global] = selected
+        self._hard_pair_lookup = hard_map if hard_map else None
 
     def _compute_accuracy(self, model, loader, epoch=0):
         # ensure adapters are blended before running any inference
